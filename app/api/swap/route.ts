@@ -1,32 +1,52 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Ensure Node runtime (not edge) for multipart/FormData proxying
 export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
   try {
     const modalUrl = process.env.MODAL_URL;
+
     if (!modalUrl) {
-      return NextResponse.json({ error: "MODAL_URL not set" }, { status: 500 });
+      // ✅ loud, structured logs in Vercel
+      console.error(
+        JSON.stringify({
+          level: "error",
+          where: "api/swap",
+          msg: "Missing MODAL_URL env",
+          hint: "Set MODAL_URL in Vercel Project → Settings → Environment Variables and redeploy.",
+        })
+      );
+      return NextResponse.json(
+        {
+          error: "Server missing MODAL_URL. Set it in environment variables and redeploy.",
+          hint: "Vercel → Project → Settings → Environment Variables → MODAL_URL",
+        },
+        { status: 500 }
+      );
     }
 
-    // Forward incoming multipart/form-data to Modal
-    const form = await req.formData();
-
+    const form = await req.formData(); // keeps original multipart boundary
     const resp = await fetch(`${modalUrl}/swap`, {
       method: "POST",
       body: form,
-      // FastAPI reads the multipart boundary automatically
     });
 
     if (!resp.ok) {
-      // Try to extract JSON error from backend
       let detail: any = null;
       try {
         detail = await resp.json();
       } catch {
-        // Ignore
+        /* ignore */
       }
+      console.error(
+        JSON.stringify({
+          level: "error",
+          where: "api/swap",
+          msg: "Modal backend returned non-200",
+          status: resp.status,
+          detail: detail?.detail ?? null,
+        })
+      );
       return NextResponse.json(
         { error: detail?.detail ?? `Modal error: ${resp.status}` },
         { status: resp.status }
@@ -39,9 +59,14 @@ export async function POST(req: NextRequest) {
       status: 200,
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? "Proxy failed" },
-      { status: 500 }
+    console.error(
+      JSON.stringify({
+        level: "error",
+        where: "api/swap",
+        msg: "Unhandled exception",
+        error: e?.message ?? String(e),
+      })
     );
+    return NextResponse.json({ error: e?.message ?? "Proxy failed" }, { status: 500 });
   }
 }
