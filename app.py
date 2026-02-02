@@ -14,25 +14,17 @@ app = FastAPI(title="MorphAI FaceSwap")
 
 # ---- CORS ----
 app.add_middleware(
-    CORSMiddleware,
-    ALLOWED_ORIGINS = [
-    "https://www.morphai.net",
-    "https://morphai.net",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
-# allow vercel preview domains too
-ALLOW_ORIGIN_REGEX = r"^https:\/\/.*\.vercel\.app$"
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=ALLOW_ORIGIN_REGEX,
-    allow_credentials=False,   # IMPORTANT: keep False unless you use cookies/sessions
+   CORSMiddleware,
+    allow_origins=[
+        "https://www.morphai.net",
+        "https://morphai.net",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
 # ---- Model download settings ----
