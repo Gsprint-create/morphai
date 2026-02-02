@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import os
+import re
 import cv2
 import numpy as np
 import urllib.request
@@ -14,14 +15,24 @@ app = FastAPI(title="MorphAI FaceSwap")
 # ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://*.vercel.app",
-    ],
-    allow_credentials=True,
+    ALLOWED_ORIGINS = [
+    "https://www.morphai.net",
+    "https://morphai.net",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+# allow vercel preview domains too
+ALLOW_ORIGIN_REGEX = r"^https:\/\/.*\.vercel\.app$"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,
+    allow_credentials=False,   # IMPORTANT: keep False unless you use cookies/sessions
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ---- Model download settings ----
