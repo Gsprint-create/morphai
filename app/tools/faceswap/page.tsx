@@ -345,60 +345,43 @@ export default function FaceSwapPage() {
   }
 
 async function handleSingleSwap() {
-  if (isProcessing) return;
-
-  // Capture stable references (so TS knows they're not null below)
-  const src = singleSource;
-  const tgt = target;
-
-  if (!src || !tgt) {
-    alert("Please select both Source and Target images.");
-    return;
-  }
+  if (!singleSource || !target || isProcessing) return;
 
   setIsProcessing(true);
   clearResult();
-  setProgress(1);
-  setStage("upload");
-
-  cancelInFlight();
-  const controller = new AbortController();
-  abortRef.current = controller;
 
   try {
     const fd = new FormData();
-    fd.append("source", src.file);  // source first
-    fd.append("target", tgt.file);  // target second
+    fd.append("source", singleSource.file); // source face
+    fd.append("target", target.file);       // target image
 
-    const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000"}/swap/single`, {
+    const base = process.env.NEXT_PUBLIC_BACKEND_URL;
+    if (!base) {
+      alert("Missing NEXT_PUBLIC_BACKEND_URL in .env.local");
+      return;
+    }
+
+    const res = await fetch(`${base}/swap/single`, {
       method: "POST",
       body: fd,
-      signal: controller.signal,
     });
 
     if (!res.ok) {
       const txt = await res.text();
       alert(txt || "Swap failed");
-      stopProgressError("error");
       return;
     }
 
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     setResultUrl(url);
-
-    stopProgressDone();
-  } catch (err: any) {
-    if (err?.name === "AbortError") stopProgressError("canceled");
-    else {
-      alert(err?.message || "Swap failed");
-      stopProgressError("error");
-    }
+  } catch (e: any) {
+    alert(e?.message || "Swap failed");
   } finally {
     setIsProcessing(false);
-    abortRef.current = null;
   }
 }
+
 
 
 
