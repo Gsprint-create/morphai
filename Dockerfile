@@ -4,15 +4,9 @@ WORKDIR /app
 
 # Install compiler + libs needed for insightface build and opencv runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    g++ \
-    gcc \
-    make \
-    python3-dev \
-    libgl1 \
-    libglib2.0-0 \
-    libopenblas0 \
+    libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 \
   && rm -rf /var/lib/apt/lists/*
+
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

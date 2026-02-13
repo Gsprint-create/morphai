@@ -2,7 +2,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import os
-import re
 import cv2
 import numpy as np
 import urllib.request
@@ -12,9 +11,8 @@ from insightface.model_zoo import get_model
 
 app = FastAPI(title="MorphAI FaceSwap")
 
-# ---- CORS ----
 app.add_middleware(
-   CORSMiddleware,
+    CORSMiddleware,
     allow_origins=[
         "https://www.morphai.net",
         "https://morphai.net",
@@ -27,40 +25,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Model download settings ----
 MODEL_PATH = os.environ.get("INSWAPPER_PATH", "inswapper_128.onnx")
-MODEL_URL = os.environ.get("INSWAPPER_URL", "")  # set in Railway Variables
+MODEL_URL = os.environ.get("INSWAPPER_URL", "")
 
 def ensure_model():
     if os.path.exists(MODEL_PATH):
         return
-
     if not MODEL_URL:
         raise RuntimeError(
             f"Missing model file: {MODEL_PATH}. "
             f"Set INSWAPPER_URL env var to a direct download link."
         )
-
     print(f"Downloading model to {MODEL_PATH} ...")
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
     print("Model download complete.")
 
-# ---- InsightFace init ----
 PROVIDERS = ["CPUExecutionProvider"]  # Railway CPU
 face_app = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
 
+SWAPPER = None  # ✅ cache swapper globally
+
 @app.on_event("startup")
 def startup():
+    global SWAPPER
     ensure_model()
-    # CPU => ctx_id=-1
     face_app.prepare(ctx_id=-1, det_size=(640, 640))
+    SWAPPER = get_model(MODEL_PATH, providers=PROVIDERS)  # ✅ load once
 
-# Load swapper after model exists
-def get_swapper():
-    ensure_model()
-    return get_model(MODEL_PATH, providers=PROVIDERS)
-
-# ---- Helpers ----
 async def read_image(upload: UploadFile) -> np.ndarray:
     data = await upload.read()
     if not data:
@@ -70,21 +61,62 @@ async def read_image(upload: UploadFile) -> np.ndarray:
         raise HTTPException(status_code=400, detail="Invalid image file")
     return img
 
-# ---- Routes ----
+def unsharp_mask(img, amount=0.35, radius=1.2, threshold=3):
+    """Mild sharpening that won’t destroy skin tones."""
+    blurred = cv2.GaussianBlur(img, (0, 0), radius)
+    sharp = cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0)
+    if threshold > 0:
+        low_contrast = np.abs(img.astype(np.int16) - blurred.astype(np.int16)) < threshold
+        sharp[low_contrast] = img[low_contrast]
+    return sharp
+
+def sharpen_face_roi(img, bbox, amount=0.35, radius=1.2):
+    """
+    Sharpen only around the face bbox using a soft elliptical mask
+    to avoid halos at the edges.
+    """
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+
+    # expand bbox slightly (helps keep details around eyes/cheeks)
+    bw = x2 - x1
+    bh = y2 - y1
+    pad = int(max(bw, bh) * 0.18)
+
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(w, x2 + pad)
+    y2 = min(h, y2 + pad)
+
+    roi = img[y1:y2, x1:x2]
+    if roi.size == 0:
+        return img
+
+    sharp = unsharp_mask(roi, amount=amount, radius=radius, threshold=3)
+
+    # soft elliptical mask
+    mask = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.float32)
+    center = (roi.shape[1] // 2, roi.shape[0] // 2)
+    axes = (int(roi.shape[1] * 0.42), int(roi.shape[0] * 0.48))
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=roi.shape[1] * 0.03)
+
+    mask3 = np.dstack([mask, mask, mask])
+    blended = (sharp.astype(np.float32) * mask3 + roi.astype(np.float32) * (1 - mask3)).astype(np.uint8)
+
+    out = img.copy()
+    out[y1:y2, x1:x2] = blended
+    return out
+
 @app.get("/")
 def root():
     return {"status": "ok", "engine": "inswapper_128", "cpu": True}
 
 @app.post("/swap/single")
-async def swap_single(
-    source: UploadFile = File(...),
-    target: UploadFile = File(...),
-):
-    """
-    IMPORTANT:
-    source = face to insert
-    target = image to receive the face
-    """
+async def swap_single(source: UploadFile = File(...), target: UploadFile = File(...)):
+    global SWAPPER
+    if SWAPPER is None:
+        raise HTTPException(status_code=500, detail="Swapper not initialized")
 
     src_img = await read_image(source)
     tgt_img = await read_image(target)
@@ -97,14 +129,14 @@ async def swap_single(
     if not tgt_faces:
         raise HTTPException(status_code=400, detail="No face found in target image")
 
-    swapper = get_swapper()
-
     src_face = src_faces[0]
     result = tgt_img.copy()
 
-    # swap on all target faces
     for face in tgt_faces:
-        result = swapper.get(result, face, src_face, paste_back=True)
+        result = SWAPPER.get(result, face, src_face, paste_back=True)
+
+        # ✅ Recover sharpness (tune amount/radius if needed)
+        result = sharpen_face_roi(result, face.bbox, amount=0.35, radius=1.2)
 
     ok, buf = cv2.imencode(".png", result)
     if not ok:
