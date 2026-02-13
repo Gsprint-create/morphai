@@ -14,6 +14,7 @@ app = FastAPI(title="MorphAI FaceSwap")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://morphai-frontend.vercel.app",  # ✅ add this explicitly
         "https://www.morphai.net",
         "https://morphai.net",
         "http://localhost:3000",
@@ -23,7 +24,10 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
+
 
 MODEL_PATH = os.environ.get("INSWAPPER_PATH", "inswapper_128.onnx")
 MODEL_URL = os.environ.get("INSWAPPER_URL", "")
