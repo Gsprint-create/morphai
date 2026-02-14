@@ -202,7 +202,7 @@ result = SWAPPER.get(result, tgt_face, src_face, paste_back=True)
 result = sharpen_face_roi(result, tgt_face.bbox, amount=0.35, radius=1.2)
 
 
-    ok, buf = cv2.imencode(".png", result)
+   ok, buf = cv2.imencode(".png", result)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode image")
 
