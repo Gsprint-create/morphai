@@ -3,8 +3,6 @@ from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import os
-import pathlib
-import urllib.request
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -12,102 +10,49 @@ import onnxruntime as ort
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
 
-# OPTIONAL restoration (GFPGAN)
-# Keep import at top; if torchvision issues happen, you’ll see it immediately.
+# OPTIONAL: restoration
 try:
     from gfpgan import GFPGANer
-    GFPGAN_IMPORT_OK = True
-except Exception as e:
-    GFPGAN_IMPORT_OK = False
-    GFPGAN_IMPORT_ERR = str(e)
+    HAS_GFPGAN = True
+except Exception:
     GFPGANer = None
+    HAS_GFPGAN = False
 
 
 # ============================================================
-# PATHS + DOWNLOAD (production-grade)
+# CONFIG
 # ============================================================
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+APP_NAME = "MorphAI FaceSwap (Hollywood)"
+MODEL_PATH = os.environ.get("INSWAPPER_PATH", "models/inswapper_128.onnx")
+GFPGAN_PATH = os.environ.get("GFPGAN_PATH", "models/GFPGANv1.4.pth")
 
-INSWAPPER_PATH = str(MODELS_DIR / "inswapper_128.onnx")
-GFPGAN_PATH = str(MODELS_DIR / "GFPGANv1.4.pth")
+ALLOW_ORIGINS = [
+    "https://morphai-frontend.vercel.app",
+    "https://www.morphai.net",
+    "https://morphai.net",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
-# Provide URLs via env vars (required on Railway, optional locally)
-INSWAPPER_URL = os.getenv("INSWAPPER_URL", "").strip()  # required if file not present
-GFPGAN_URL = os.getenv("GFPGAN_URL", "").strip()        # optional
-
-# If you're behind a tunnel with self-signed/cert quirks, this can help:
-# (usually not needed; leave off)
-ALLOW_INSECURE_DOWNLOAD = os.getenv("ALLOW_INSECURE_DOWNLOAD", "0") == "1"
-
-
-def download_if_missing(path: str, url: str, label: str):
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        print(f"[{label}] OK: {path} ({os.path.getsize(path)} bytes)")
-        return
-
-    if not url:
-        raise RuntimeError(
-            f"[{label}] Missing file: {path}. "
-            f"Set {label}_URL env var to a direct download link."
-        )
-
-    print(f"[{label}] Downloading from {url} -> {path}")
-
-    # Basic, robust download
-    try:
-        if ALLOW_INSECURE_DOWNLOAD:
-            import ssl
-            ssl._create_default_https_context = ssl._create_unverified_context
-
-        urllib.request.urlretrieve(url, path)
-
-        # sanity size check
-        if not os.path.exists(path) or os.path.getsize(path) < 1024 * 1024:
-            raise RuntimeError(f"[{label}] Downloaded file looks too small: {path}")
-
-        print(f"[{label}] Download complete: {path} ({os.path.getsize(path)} bytes)")
-    except Exception as e:
-        # remove partial file
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-        raise RuntimeError(f"[{label}] Download failed: {e}")
-
-
-# ============================================================
-# PROVIDERS (CPU on Railway, GPU locally if available)
-# ============================================================
-
-AVAILABLE_PROVIDERS = ort.get_available_providers()
-
-if "CUDAExecutionProvider" in AVAILABLE_PROVIDERS:
-    PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    USING_GPU = True
-else:
-    PROVIDERS = ["CPUExecutionProvider"]
-    USING_GPU = False
+# Providers (GPU if available locally)
+providers = (
+    ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    if "CUDAExecutionProvider" in ort.get_available_providers()
+    else ["CPUExecutionProvider"]
+)
+USING_GPU = providers[0] == "CUDAExecutionProvider"
 
 
 # ============================================================
 # FASTAPI
 # ============================================================
 
-app = FastAPI(title="MorphAI FaceSwap", version="1.0.0")
+app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://morphai-frontend.vercel.app",
-        "https://morphai.net",
-        "https://www.morphai.net",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=ALLOW_ORIGINS,
     allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
     allow_credentials=False,
     allow_methods=["*"],
@@ -121,89 +66,9 @@ app.add_middleware(
 # GLOBAL MODELS
 # ============================================================
 
-face_app = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
+face_app = FaceAnalysis(name="buffalo_l", providers=providers)
 SWAPPER = None
 GFPGAN = None
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-@app.on_event("startup")
-def startup():
-    global SWAPPER, GFPGAN
-
-    # Ensure required swapper model exists
-    download_if_missing(INSWAPPER_PATH, INSWAPPER_URL, "INSWAPPER")
-
-    # Prepare face detector/recognizer (buffalo_l auto-downloads)
-    face_app.prepare(ctx_id=0 if USING_GPU else -1, det_size=(640, 640))
-
-    # Load swapper once
-    SWAPPER = get_model(INSWAPPER_PATH, providers=PROVIDERS)
-    print(f"[INSWAPPER] Loaded with providers={PROVIDERS}")
-
-    # Optional GFPGAN
-    if GFPGAN_IMPORT_OK:
-        if os.path.exists(GFPGAN_PATH) and os.path.getsize(GFPGAN_PATH) > 0:
-            try:
-                GFPGAN = GFPGANer(
-                    model_path=GFPGAN_PATH,
-                    upscale=1,
-                    arch="clean",
-                    channel_multiplier=2,
-                    bg_upsampler=None
-                )
-                print("[GFPGAN] Loaded")
-            except Exception as e:
-                GFPGAN = None
-                print("[GFPGAN] Failed to init:", e)
-        elif GFPGAN_URL:
-            # download then try load
-            try:
-                download_if_missing(GFPGAN_PATH, GFPGAN_URL, "GFPGAN")
-                GFPGAN = GFPGANer(
-                    model_path=GFPGAN_PATH,
-                    upscale=1,
-                    arch="clean",
-                    channel_multiplier=2,
-                    bg_upsampler=None
-                )
-                print("[GFPGAN] Downloaded+Loaded")
-            except Exception as e:
-                GFPGAN = None
-                print("[GFPGAN] Not available:", e)
-        else:
-            print("[GFPGAN] Not found — disabled (set GFPGAN_URL or provide models/GFPGANv1.4.pth)")
-    else:
-        print("[GFPGAN] Import failed — disabled:", GFPGAN_IMPORT_ERR)
-
-
-# ============================================================
-# HEALTH / DEBUG
-# ============================================================
-
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "engine": "inswapper_128",
-        "gpu": USING_GPU,
-        "providers_available": AVAILABLE_PROVIDERS,
-        "providers_using": PROVIDERS,
-        "inswapper_present": os.path.exists(INSWAPPER_PATH),
-        "gfpgan_present": os.path.exists(GFPGAN_PATH),
-        "gfpgan_enabled": GFPGAN is not None,
-        "gfpgan_import_ok": GFPGAN_IMPORT_OK,
-    }
-
-
-@app.get("/health")
-def health():
-    if SWAPPER is None:
-        return JSONResponse({"status": "booting", "detail": "swapper not initialized yet"}, status_code=503)
-    return {"status": "healthy"}
 
 
 # ============================================================
@@ -221,119 +86,367 @@ def read_image(upload: UploadFile) -> np.ndarray:
 
 
 def clamp_bbox(x1, y1, x2, y2, w, h):
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(w, int(x2))
-    y2 = min(h, int(y2))
+    x1 = max(0, int(x1)); y1 = max(0, int(y1))
+    x2 = min(w, int(x2)); y2 = min(h, int(y2))
     if x2 <= x1 or y2 <= y1:
         return None
     return x1, y1, x2, y2
 
 
-# ---------- AUTO QUALITY DETECTION ----------
-
 def roi_sharpness_score(bgr: np.ndarray) -> float:
-    """Higher = sharper (Laplacian variance)."""
     if bgr is None or bgr.size == 0:
         return 0.0
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
 def should_restore_face(
     roi_bgr: np.ndarray,
     face_w: int,
     face_h: int,
-    sharp_thresh: float = 85.0,
-    min_face_side: int = 120,
+    sharp_thresh: float = 60.0,
+    min_face_side: int = 110,
 ) -> bool:
-    # restore if small face or blurry
+    """
+    HOLLYWOOD GATING:
+    Restore only if face is SMALL *and* BLURRY.
+    This avoids the plastic look on big sharp faces.
+    """
     if roi_bgr is None or roi_bgr.size == 0:
         return False
-    if min(face_w, face_h) < int(min_face_side):
-        return True
+    if min(face_w, face_h) > int(min_face_side):
+        return False
     return roi_sharpness_score(roi_bgr) < float(sharp_thresh)
 
 
-# ---------- COLOR HARMONIZATION ----------
+# ---------------------------
+# HOLLYWOOD MASK (landmarks hull + feather)
+# ---------------------------
 
-def lab_match(src_bgr, ref_bgr):
+def get_landmarks(face) -> np.ndarray | None:
+    """
+    Tries to use 106 landmarks (best). Falls back to 5 keypoints if needed.
+    InsightFace Face object often has .landmark_2d_106 for buffalo_l.
+    """
+    lm = None
+    if hasattr(face, "landmark_2d_106") and face.landmark_2d_106 is not None:
+        lm = np.array(face.landmark_2d_106, dtype=np.int32)
+    elif hasattr(face, "kps") and face.kps is not None:
+        lm = np.array(face.kps, dtype=np.int32)
+    return lm
+
+
+def build_face_mask_from_landmarks(img_shape, landmarks: np.ndarray, feather: float = 0.06, grow: int = 12):
+    """
+    Creates a soft mask from landmark convex hull.
+    feather: relative softness (0.03..0.15)
+    grow: dilate pixels to cover cheeks/jawline
+    """
+    h, w = img_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    if landmarks is None or len(landmarks) < 3:
+        return mask
+
+    hull = cv2.convexHull(landmarks.reshape(-1, 1, 2))
+    cv2.fillConvexPoly(mask, hull, 255)
+
+    if grow > 0:
+        k = max(3, int(grow) | 1)
+        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=1)
+
+    # Feather (Gaussian blur)
+    sigma = max(1.0, float(max(h, w)) * float(feather))
+    soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+    soft_f = (soft.astype(np.float32) / 255.0)
+    return soft_f  # float 0..1
+
+
+# ---------------------------
+# HOLLYWOOD COLOR MATCH (LAB mean/std inside mask)
+# ---------------------------
+
+def lab_match_masked(src_bgr, ref_bgr, mask_f, strength: float = 1.0):
+    """
+    Matches src to ref in LAB using mean/std only inside mask.
+    strength: 0..1 (blend toward matched)
+    """
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return src_bgr
+
     src = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     ref = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
+    m = mask_f[..., None].astype(np.float32)
+    eps = 1e-6
+
+    out = src.copy()
     for c in range(3):
-        s_mean, s_std = float(src[:, :, c].mean()), float(src[:, :, c].std())
-        r_mean, r_std = float(ref[:, :, c].mean()), float(ref[:, :, c].std())
-        src[:, :, c] = (src[:, :, c] - s_mean) * (r_std / (s_std + 1e-6)) + r_mean
+        s = src[..., c]
+        r = ref[..., c]
 
-    src = np.clip(src, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(src, cv2.COLOR_LAB2BGR)
+        sw = (s * m[..., 0]).sum()
+        rw = (r * m[..., 0]).sum()
+        mw = m[..., 0].sum() + eps
+
+        s_mean = sw / mw
+        r_mean = rw / mw
+
+        s_var = (((s - s_mean) ** 2) * m[..., 0]).sum() / mw
+        r_var = (((r - r_mean) ** 2) * m[..., 0]).sum() / mw
+
+        s_std = np.sqrt(s_var + eps)
+        r_std = np.sqrt(r_var + eps)
+
+        matched = (s - s_mean) * (r_std / (s_std + eps)) + r_mean
+        out[..., c] = matched
+
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    out_bgr = cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
+
+    # Blend by strength inside mask
+    blended = (out_bgr.astype(np.float32) * (m * strength) +
+               src_bgr.astype(np.float32) * (1.0 - (m * strength)))
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
-def harmonize(result_bgr, target_bgr, bbox):
-    x1, y1, x2, y2 = bbox
-    roi = result_bgr[y1:y2, x1:x2]
-    ref = target_bgr[y1:y2, x1:x2]
-    if roi.size == 0 or ref.size == 0:
-        return result_bgr
+# ---------------------------
+# HOLLYWOOD LIGHT MATCH (L channel gain+bias inside mask)
+# ---------------------------
 
-    matched = lab_match(roi, ref)
+def match_lighting_masked(src_bgr, ref_bgr, mask_f, strength: float = 0.7):
+    """
+    Adjusts src brightness/contrast to match ref using L channel statistics inside mask.
+    strength: 0..1
+    """
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return src_bgr
 
-    # soft elliptical mask
-    mask = np.zeros((roi.shape[0], roi.shape[1]), np.float32)
-    cv2.ellipse(
-        mask,
-        (roi.shape[1] // 2, roi.shape[0] // 2),
-        (int(roi.shape[1] * 0.42), int(roi.shape[0] * 0.48)),
-        0, 0, 360, 1.0, -1
-    )
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(1.0, roi.shape[1] * 0.04))
-    mask3 = np.dstack([mask] * 3)
+    src_lab = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref_lab = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    blended = (matched.astype(np.float32) * mask3 + roi.astype(np.float32) * (1.0 - mask3)).astype(np.uint8)
+    m = mask_f.astype(np.float32)
+    eps = 1e-6
 
-    out = result_bgr.copy()
-    out[y1:y2, x1:x2] = blended
+    sL = src_lab[..., 0]
+    rL = ref_lab[..., 0]
+
+    mw = m.sum() + eps
+    s_mean = (sL * m).sum() / mw
+    r_mean = (rL * m).sum() / mw
+
+    s_var = (((sL - s_mean) ** 2) * m).sum() / mw
+    r_var = (((rL - r_mean) ** 2) * m).sum() / mw
+
+    s_std = np.sqrt(s_var + eps)
+    r_std = np.sqrt(r_var + eps)
+
+    gain = r_std / (s_std + eps)
+    bias = r_mean - gain * s_mean
+
+    newL = gain * sL + bias
+    src_lab[..., 0] = np.clip((1.0 - strength) * sL + strength * newL, 0, 255)
+
+    out = cv2.cvtColor(src_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     return out
 
 
-# ---------- SHARPEN ----------
+# ---------------------------
+# DETAIL POP (micro-contrast) inside mask
+# ---------------------------
 
-def sharpen(img_bgr, bbox, amount=0.35, radius=1.2):
-    x1, y1, x2, y2 = bbox
-    roi = img_bgr[y1:y2, x1:x2]
-    if roi.size == 0:
+def detail_pop_masked(img_bgr, mask_f, sigma_s=8, sigma_r=0.15, strength=0.6):
+    """
+    Adds micro-contrast but avoids crunchy edges.
+    """
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
         return img_bgr
 
-    blurred = cv2.GaussianBlur(roi, (0, 0), radius)
-    sharp = cv2.addWeighted(roi, 1.0 + amount, blurred, -amount, 0)
+    enhanced = cv2.detailEnhance(img_bgr, sigma_s=float(sigma_s), sigma_r=float(sigma_r))
+    m = mask_f[..., None].astype(np.float32)
+    out = enhanced.astype(np.float32) * (m * strength) + img_bgr.astype(np.float32) * (1.0 - (m * strength))
+    return np.clip(out, 0, 255).astype(np.uint8)
 
+
+# ---------------------------
+# TARGETED SHARPEN (eyes + mouth) from keypoints
+# ---------------------------
+
+def unsharp(bgr, amount=0.35, radius=1.2):
+    blur = cv2.GaussianBlur(bgr, (0, 0), float(radius))
+    sharp = cv2.addWeighted(bgr, 1.0 + float(amount), blur, -float(amount), 0)
+    return sharp
+
+
+def circle_mask(h, w, cx, cy, r, feather=0.35):
+    mask = np.zeros((h, w), np.float32)
+    cv2.circle(mask, (int(cx), int(cy)), int(r), 1.0, -1)
+    sigma = max(1.0, r * float(feather))
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return mask
+
+
+def sharpen_keypoints(img_bgr, face, eye_strength=0.65, mouth_strength=0.35):
+    """
+    Uses 5 keypoints when available:
+      kps: [left_eye, right_eye, nose, left_mouth, right_mouth]
+    Applies gentle unsharp in small soft circles.
+    """
+    if not hasattr(face, "kps") or face.kps is None:
+        return img_bgr
+
+    kps = np.array(face.kps, dtype=np.float32)
+    h, w = img_bgr.shape[:2]
     out = img_bgr.copy()
-    out[y1:y2, x1:x2] = sharp
-    return out
+    sharp = unsharp(out, amount=0.40, radius=1.0)
+
+    # scale radius from bbox
+    x1, y1, x2, y2 = [int(v) for v in face.bbox]
+    fw = max(20, x2 - x1)
+    r_eye = int(fw * 0.09)
+    r_mouth = int(fw * 0.10)
+
+    le, re, _, lm, rm = kps
+
+    m_eye = circle_mask(h, w, le[0], le[1], r_eye) + circle_mask(h, w, re[0], re[1], r_eye)
+    m_eye = np.clip(m_eye, 0, 1)[..., None]
+
+    mouth_cx = (lm[0] + rm[0]) * 0.5
+    mouth_cy = (lm[1] + rm[1]) * 0.5
+    m_mouth = circle_mask(h, w, mouth_cx, mouth_cy, r_mouth)[..., None]
+
+    out = (sharp.astype(np.float32) * (m_eye * eye_strength) + out.astype(np.float32) * (1.0 - (m_eye * eye_strength)))
+    out = (sharp.astype(np.float32) * (m_mouth * mouth_strength) + out.astype(np.float32) * (1.0 - (m_mouth * mouth_strength)))
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# ---------------------------
+# OPTIONAL seam blending
+# ---------------------------
+
+def seamless_clone_blend(result_bgr, target_bgr, mask_f, bbox):
+    """
+    OpenCV seamlessClone for the face region only.
+    mask: float 0..1 -> uint8 0..255
+    """
+    x1, y1, x2, y2 = bbox
+    roi_res = result_bgr[y1:y2, x1:x2]
+    roi_tgt = target_bgr[y1:y2, x1:x2]
+    if roi_res.size == 0:
+        return result_bgr
+
+    m = (mask_f[y1:y2, x1:x2] * 255.0).astype(np.uint8)
+    if m.sum() < 10:
+        return result_bgr
+
+    center = (x1 + (x2 - x1) // 2, y1 + (y2 - y1) // 2)
+
+    # mask must be same size as full image for seamlessClone
+    full_mask = np.zeros(target_bgr.shape[:2], np.uint8)
+    full_mask[y1:y2, x1:x2] = m
+
+    try:
+        blended = cv2.seamlessClone(result_bgr, target_bgr, full_mask, center, cv2.NORMAL_CLONE)
+        return blended
+    except Exception:
+        return result_bgr
 
 
 # ============================================================
-# ROUTE
+# STARTUP
 # ============================================================
+
+@app.on_event("startup")
+def startup():
+    global SWAPPER, GFPGAN
+
+    face_app.prepare(ctx_id=0 if USING_GPU else -1, det_size=(640, 640))
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"[FATAL] inswapper missing: {MODEL_PATH}")
+        # Don’t crash hard in prod; return a clear health error instead
+        SWAPPER = None
+        return
+
+    SWAPPER = get_model(MODEL_PATH, providers=providers)
+
+    if HAS_GFPGAN and os.path.exists(GFPGAN_PATH):
+        try:
+            GFPGAN = GFPGANer(
+                model_path=GFPGAN_PATH,
+                upscale=1,
+                arch="clean",
+                channel_multiplier=2,
+                bg_upsampler=None,
+            )
+            print("GFPGAN loaded")
+        except Exception as e:
+            print("GFPGAN failed to load:", e)
+            GFPGAN = None
+    else:
+        GFPGAN = None
+        print("GFPGAN not found — disabled")
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/")
+def root():
+    using = providers
+    return {
+        "status": "ok" if SWAPPER is not None else "degraded",
+        "engine": "inswapper_128",
+        "providers": ort.get_available_providers(),
+        "using": using,
+        "gpu": USING_GPU,
+        "gfpgan": GFPGAN is not None,
+        "model_path": MODEL_PATH,
+    }
+
+
+@app.get("/health")
+def health():
+    if SWAPPER is None:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "error": f"Missing model file: {MODEL_PATH}"},
+        )
+    return {"ok": True}
+
 
 @app.post("/swap/single")
 async def swap_single(
     source: UploadFile = File(...),
     target: UploadFile = File(...),
 
-    # restore controls (exposed)
-    restore_sharp_thresh: float = Query(85.0, ge=10.0, le=500.0),
-    restore_min_face_side: int = Query(120, ge=32, le=512),
+    # --------- RESTORE controls (GFPGAN) ----------
+    restore_sharp_thresh: float = Query(60.0, ge=10.0, le=500.0),
+    restore_min_face_side: int = Query(110, ge=32, le=512),
     restore_force: bool = Query(False),
     restore_disable: bool = Query(False),
 
-    # tuning knobs
-    sharpen_amount: float = Query(0.35, ge=0.0, le=1.0),
-    sharpen_radius: float = Query(1.2, ge=0.5, le=5.0),
+    # --------- HOLLYWOOD blend controls ----------
+    mask_feather: float = Query(0.07, ge=0.02, le=0.20),
+    mask_grow: int = Query(12, ge=0, le=60),
+
+    color_strength: float = Query(0.85, ge=0.0, le=1.0),
+    light_strength: float = Query(0.70, ge=0.0, le=1.0),
+    detail_strength: float = Query(0.55, ge=0.0, le=1.0),
+
+    eye_detail: float = Query(0.65, ge=0.0, le=1.0),
+    mouth_detail: float = Query(0.35, ge=0.0, le=1.0),
+
+    use_seamless_clone: bool = Query(False),
 ):
     if SWAPPER is None:
-        raise HTTPException(503, "Swapper not initialized yet")
+        raise HTTPException(503, f"Server missing model file: {MODEL_PATH}")
 
     src = read_image(source)
     tgt = read_image(target)
@@ -343,15 +456,15 @@ async def swap_single(
     tgt_faces = face_app.get(tgt)
 
     if not src_faces:
-        raise HTTPException(400, "No face found in source image")
+        raise HTTPException(400, "No face found in source")
     if not tgt_faces:
-        raise HTTPException(400, "No face found in target image")
+        raise HTTPException(400, "No face found in target")
 
     src_face = src_faces[0]
     result = tgt.copy()
 
     for face in tgt_faces:
-        # 1) swap
+        # 1) Swap
         result = SWAPPER.get(result, face, src_face, paste_back=True)
 
         # bbox safe
@@ -361,40 +474,50 @@ async def swap_single(
             continue
 
         x1, y1, x2, y2 = bb
-        face_w = x2 - x1
-        face_h = y2 - y1
+        roi_res = result[y1:y2, x1:x2]
+        roi_tgt = tgt_original[y1:y2, x1:x2]
+        if roi_res.size == 0:
+            continue
 
-        # 2) color harmonization
-        result = harmonize(result, tgt_original, bb)
+        # 2) Build landmark mask (best realism)
+        lms = get_landmarks(face)
+        mask_f = build_face_mask_from_landmarks(result.shape, lms, feather=mask_feather, grow=mask_grow)
 
-        # 3) restore (GFPGAN) - auto gated unless forced
-        if GFPGAN is not None and (not restore_disable):
-            roi = result[y1:y2, x1:x2]
-            if roi.size > 0:
-                do_restore = restore_force or should_restore_face(
-                    roi_bgr=roi,
-                    face_w=face_w,
-                    face_h=face_h,
-                    sharp_thresh=float(restore_sharp_thresh),
-                    min_face_side=int(restore_min_face_side),
-                )
+        # 3) Hollywood color match (skin tone / temp)
+        result = lab_match_masked(result, tgt_original, mask_f, strength=color_strength)
 
-                if do_restore:
-                    try:
-                        # GFPGAN returns (cropped_faces, restored_faces, restored_img)
-                        _, _, restored_roi = GFPGAN.enhance(
-                            roi,
-                            has_aligned=False,
-                            paste_back=True
-                        )
-                        if restored_roi is not None and restored_roi.shape == roi.shape:
-                            result[y1:y2, x1:x2] = restored_roi
-                    except Exception as e:
-                        # don’t fail the whole request
-                        print("[GFPGAN] enhance failed:", e)
+        # 4) Hollywood lighting match (shadows + exposure)
+        result = match_lighting_masked(result, tgt_original, mask_f, strength=light_strength)
 
-        # 4) sharpen
-        result = sharpen(result, bb, amount=float(sharpen_amount), radius=float(sharpen_radius))
+        # refresh ROI after adjustments
+        roi_res = result[y1:y2, x1:x2]
+
+        # 5) Restore (GFPGAN) only when SMALL + BLURRY (or forced)
+        if (GFPGAN is not None) and (not restore_disable):
+            do_restore = restore_force or should_restore_face(
+                roi_bgr=roi_res,
+                face_w=(x2 - x1),
+                face_h=(y2 - y1),
+                sharp_thresh=float(restore_sharp_thresh),
+                min_face_side=int(restore_min_face_side),
+            )
+            if do_restore:
+                try:
+                    _, _, restored = GFPGAN.enhance(roi_res, has_aligned=False, paste_back=True)
+                    if restored is not None and restored.shape == roi_res.shape:
+                        result[y1:y2, x1:x2] = restored
+                except Exception as e:
+                    print("GFPGAN failed:", e)
+
+        # 6) Micro-texture pop (inside mask only)
+        result = detail_pop_masked(result, mask_f, sigma_s=8, sigma_r=0.15, strength=detail_strength)
+
+        # 7) Eyes + mouth only (prevents crunchy skin)
+        result = sharpen_keypoints(result, face, eye_strength=eye_detail, mouth_strength=mouth_detail)
+
+        # 8) Optional seamless clone (great for hard lighting changes)
+        if use_seamless_clone:
+            result = seamless_clone_blend(result, tgt_original, mask_f, bb)
 
     ok, buf = cv2.imencode(".png", result)
     if not ok:
