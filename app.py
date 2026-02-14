@@ -7,8 +7,23 @@ import onnxruntime as ort
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
 
-# OPTIONAL restoration
-from gfpgan import GFPGANer
+def ensure_torchvision_functional_tensor():
+    """
+    BasicSR (used by GFPGAN) may import torchvision.transforms.functional_tensor
+    which is missing in some torchvision builds. We shim it.
+    """
+    try:
+        from torchvision.transforms.functional_tensor import rgb_to_grayscale  # noqa: F401
+        return
+    except Exception:
+        import sys, types
+        from torchvision.transforms.functional import rgb_to_grayscale
+
+        m = types.ModuleType("torchvision.transforms.functional_tensor")
+        m.rgb_to_grayscale = rgb_to_grayscale
+        sys.modules["torchvision.transforms.functional_tensor"] = m
+
+
 
 
 # =========================
@@ -35,9 +50,17 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://morphai-frontend.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 
@@ -61,7 +84,11 @@ def startup():
     face_app.prepare(ctx_id=0 if USING_GPU else -1, det_size=(640, 640))
     SWAPPER = get_model(MODEL_PATH, providers=providers)
 
+    # ✅ prevent GFPGAN/BasicSR import crash
+    ensure_torchvision_functional_tensor()
+
     if os.path.exists(GFPGAN_PATH):
+        from gfpgan import GFPGANer  # import AFTER shim
         GFPGAN = GFPGANer(
             model_path=GFPGAN_PATH,
             upscale=1,
@@ -72,6 +99,7 @@ def startup():
         print("GFPGAN loaded")
     else:
         print("GFPGAN not found — disabled")
+
 
 
 # =========================
