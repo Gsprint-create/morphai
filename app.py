@@ -1,7 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import os
+import time
+from collections import defaultdict, deque
 import cv2
 import numpy as np
 import urllib.request
@@ -14,7 +16,7 @@ app = FastAPI(title="MorphAI FaceSwap")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://morphai-frontend.vercel.app",  # ✅ add this explicitly
+        "https://morphai-frontend.vercel.app",
         "https://www.morphai.net",
         "https://morphai.net",
         "http://localhost:3000",
@@ -28,7 +30,41 @@ app.add_middleware(
     max_age=86400,
 )
 
+# ---------------------------
+# Safety limits (A-mode)
+# ---------------------------
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8MB default
+MAX_SIDE_SOURCE = int(os.environ.get("MAX_SIDE_SOURCE", "1200"))
+MAX_SIDE_TARGET = int(os.environ.get("MAX_SIDE_TARGET", "1600"))
 
+RATE_WINDOW_SEC = int(os.environ.get("RATE_WINDOW_SEC", "30"))
+RATE_MAX_REQ = int(os.environ.get("RATE_MAX_REQ", "6"))  # 6 swaps / 30s per IP
+
+_hits = defaultdict(deque)
+
+def check_rate(ip: str) -> bool:
+    now = time.time()
+    q = _hits[ip]
+    while q and now - q[0] > RATE_WINDOW_SEC:
+        q.popleft()
+    if len(q) >= RATE_MAX_REQ:
+        return False
+    q.append(now)
+    return True
+
+def downscale_max(img: np.ndarray, max_side: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+# ---------------------------
+# Model download/init
+# ---------------------------
 MODEL_PATH = os.environ.get("INSWAPPER_PATH", "inswapper_128.onnx")
 MODEL_URL = os.environ.get("INSWAPPER_URL", "")
 
@@ -46,27 +82,33 @@ def ensure_model():
 
 PROVIDERS = ["CPUExecutionProvider"]  # Railway CPU
 face_app = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
-
-SWAPPER = None  # ✅ cache swapper globally
+SWAPPER = None  # cache swapper globally
 
 @app.on_event("startup")
 def startup():
     global SWAPPER
     ensure_model()
     face_app.prepare(ctx_id=-1, det_size=(640, 640))
-    SWAPPER = get_model(MODEL_PATH, providers=PROVIDERS)  # ✅ load once
+    SWAPPER = get_model(MODEL_PATH, providers=PROVIDERS)
 
+# ---------------------------
+# Helpers
+# ---------------------------
 async def read_image(upload: UploadFile) -> np.ndarray:
     data = await upload.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty upload")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_UPLOAD_BYTES // 1024 // 1024}MB)."
+        )
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image file")
     return img
 
 def unsharp_mask(img, amount=0.35, radius=1.2, threshold=3):
-    """Mild sharpening that won’t destroy skin tones."""
     blurred = cv2.GaussianBlur(img, (0, 0), radius)
     sharp = cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0)
     if threshold > 0:
@@ -75,14 +117,9 @@ def unsharp_mask(img, amount=0.35, radius=1.2, threshold=3):
     return sharp
 
 def sharpen_face_roi(img, bbox, amount=0.35, radius=1.2):
-    """
-    Sharpen only around the face bbox using a soft elliptical mask
-    to avoid halos at the edges.
-    """
     h, w = img.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in bbox]
 
-    # expand bbox slightly (helps keep details around eyes/cheeks)
     bw = x2 - x1
     bh = y2 - y1
     pad = int(max(bw, bh) * 0.18)
@@ -98,7 +135,6 @@ def sharpen_face_roi(img, bbox, amount=0.35, radius=1.2):
 
     sharp = unsharp_mask(roi, amount=amount, radius=radius, threshold=3)
 
-    # soft elliptical mask
     mask = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.float32)
     center = (roi.shape[1] // 2, roi.shape[0] // 2)
     axes = (int(roi.shape[1] * 0.42), int(roi.shape[0] * 0.48))
@@ -112,18 +148,37 @@ def sharpen_face_roi(img, bbox, amount=0.35, radius=1.2):
     out[y1:y2, x1:x2] = blended
     return out
 
+# ---------------------------
+# Routes
+# ---------------------------
 @app.get("/")
 def root():
     return {"status": "ok", "engine": "inswapper_128", "cpu": True}
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 @app.post("/swap/single")
-async def swap_single(source: UploadFile = File(...), target: UploadFile = File(...)):
+async def swap_single(
+    request: Request,
+    source: UploadFile = File(...),
+    target: UploadFile = File(...),
+):
     global SWAPPER
     if SWAPPER is None:
         raise HTTPException(status_code=500, detail="Swapper not initialized")
 
+    ip = request.client.host if request.client else "unknown"
+    if not check_rate(ip):
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a bit.")
+
     src_img = await read_image(source)
     tgt_img = await read_image(target)
+
+    # Downscale for speed / safety (CPU-friendly)
+    src_img = downscale_max(src_img, MAX_SIDE_SOURCE)
+    tgt_img = downscale_max(tgt_img, MAX_SIDE_TARGET)
 
     src_faces = face_app.get(src_img)
     tgt_faces = face_app.get(tgt_img)
@@ -138,8 +193,6 @@ async def swap_single(source: UploadFile = File(...), target: UploadFile = File(
 
     for face in tgt_faces:
         result = SWAPPER.get(result, face, src_face, paste_back=True)
-
-        # ✅ Recover sharpness (tune amount/radius if needed)
         result = sharpen_face_roi(result, face.bbox, amount=0.35, radius=1.2)
 
     ok, buf = cv2.imencode(".png", result)
