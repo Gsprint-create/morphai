@@ -1,209 +1,262 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import Response
-import os
-import time
-from collections import defaultdict, deque
-import cv2
-import numpy as np
-import urllib.request
+from fastapi.middleware.cors import CORSMiddleware
 
+import os, cv2, numpy as np
+import onnxruntime as ort
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
 
-app = FastAPI(title="MorphAI FaceSwap")
+# OPTIONAL restoration
+from gfpgan import GFPGANer
+
+
+# =========================
+# CONFIG
+# =========================
+
+MODEL_PATH = "models/inswapper_128.onnx"
+GFPGAN_PATH = "models/GFPGANv1.4.pth"
+
+providers = (
+    ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    if "CUDAExecutionProvider" in ort.get_available_providers()
+    else ["CPUExecutionProvider"]
+)
+
+USING_GPU = providers[0] == "CUDAExecutionProvider"
+
+
+# =========================
+# FASTAPI
+# =========================
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://morphai-frontend.vercel.app",
-        "https://www.morphai.net",
-        "https://morphai.net",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
-    allow_credentials=False,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
 )
 
-# ---------------------------
-# Safety limits (A-mode)
-# ---------------------------
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8MB default
-MAX_SIDE_SOURCE = int(os.environ.get("MAX_SIDE_SOURCE", "1200"))
-MAX_SIDE_TARGET = int(os.environ.get("MAX_SIDE_TARGET", "1600"))
 
-RATE_WINDOW_SEC = int(os.environ.get("RATE_WINDOW_SEC", "30"))
-RATE_MAX_REQ = int(os.environ.get("RATE_MAX_REQ", "6"))  # 6 swaps / 30s per IP
+# =========================
+# GLOBAL MODELS
+# =========================
 
-_hits = defaultdict(deque)
+face_app = FaceAnalysis(name="buffalo_l", providers=providers)
+SWAPPER = None
+GFPGAN = None
 
-def check_rate(ip: str) -> bool:
-    now = time.time()
-    q = _hits[ip]
-    while q and now - q[0] > RATE_WINDOW_SEC:
-        q.popleft()
-    if len(q) >= RATE_MAX_REQ:
-        return False
-    q.append(now)
-    return True
 
-def downscale_max(img: np.ndarray, max_side: int) -> np.ndarray:
-    h, w = img.shape[:2]
-    m = max(h, w)
-    if m <= max_side:
-        return img
-    scale = max_side / float(m)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-# ---------------------------
-# Model download/init
-# ---------------------------
-MODEL_PATH = os.environ.get("INSWAPPER_PATH", "inswapper_128.onnx")
-MODEL_URL = os.environ.get("INSWAPPER_URL", "")
-
-def ensure_model():
-    if os.path.exists(MODEL_PATH):
-        return
-    if not MODEL_URL:
-        raise RuntimeError(
-            f"Missing model file: {MODEL_PATH}. "
-            f"Set INSWAPPER_URL env var to a direct download link."
-        )
-    print(f"Downloading model to {MODEL_PATH} ...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("Model download complete.")
-
-PROVIDERS = ["CPUExecutionProvider"]  # Railway CPU
-face_app = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
-SWAPPER = None  # cache swapper globally
+# =========================
+# STARTUP
+# =========================
 
 @app.on_event("startup")
 def startup():
-    global SWAPPER
-    ensure_model()
-    face_app.prepare(ctx_id=-1, det_size=(640, 640))
-    SWAPPER = get_model(MODEL_PATH, providers=PROVIDERS)
+    global SWAPPER, GFPGAN
 
-# ---------------------------
-# Helpers
-# ---------------------------
-async def read_image(upload: UploadFile) -> np.ndarray:
-    data = await upload.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty upload")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large (max {MAX_UPLOAD_BYTES // 1024 // 1024}MB)."
+    face_app.prepare(ctx_id=0 if USING_GPU else -1, det_size=(640, 640))
+    SWAPPER = get_model(MODEL_PATH, providers=providers)
+
+    if os.path.exists(GFPGAN_PATH):
+        GFPGAN = GFPGANer(
+            model_path=GFPGAN_PATH,
+            upscale=1,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None
         )
+        print("GFPGAN loaded")
+    else:
+        print("GFPGAN not found — disabled")
+
+
+# =========================
+# HELPERS
+# =========================
+
+def read_image(file: UploadFile):
+    data = file.file.read()
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+        raise HTTPException(400, "Invalid image")
     return img
 
-def unsharp_mask(img, amount=0.35, radius=1.2, threshold=3):
-    blurred = cv2.GaussianBlur(img, (0, 0), radius)
-    sharp = cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0)
-    if threshold > 0:
-        low_contrast = np.abs(img.astype(np.int16) - blurred.astype(np.int16)) < threshold
-        sharp[low_contrast] = img[low_contrast]
-    return sharp
 
-def sharpen_face_roi(img, bbox, amount=0.35, radius=1.2):
-    h, w = img.shape[:2]
-    x1, y1, x2, y2 = [int(v) for v in bbox]
+def clamp_bbox(x1, y1, x2, y2, w, h):
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(w, x2); y2 = min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
 
-    bw = x2 - x1
-    bh = y2 - y1
-    pad = int(max(bw, bh) * 0.18)
 
-    x1 = max(0, x1 - pad)
-    y1 = max(0, y1 - pad)
-    x2 = min(w, x2 + pad)
-    y2 = min(h, y2 + pad)
+# ---------- AUTO QUALITY DETECTION ----------
 
+def roi_sharpness_score(bgr: np.ndarray) -> float:
+    """Higher = sharper. Uses Laplacian variance."""
+    if bgr is None or bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def should_restore_face(
+    roi_bgr: np.ndarray,
+    face_w: int,
+    face_h: int,
+    sharp_thresh: float = 85.0,
+    min_face_side: int = 120,
+) -> bool:
+    """
+    Restore if:
+    - face is small, OR
+    - ROI is soft/blurry (low Laplacian variance)
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return False
+
+    if min(face_w, face_h) < int(min_face_side):
+        return True
+
+    sharp = roi_sharpness_score(roi_bgr)
+    return sharp < float(sharp_thresh)
+
+
+# ---------- COLOR HARMONIZATION ----------
+
+def lab_match(src, ref):
+    src = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    for i in range(3):
+        s_mean, s_std = src[:, :, i].mean(), src[:, :, i].std()
+        r_mean, r_std = ref[:, :, i].mean(), ref[:, :, i].std()
+        src[:, :, i] = (src[:, :, i] - s_mean) * (r_std / (s_std + 1e-6)) + r_mean
+
+    src = np.clip(src, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(src, cv2.COLOR_LAB2BGR)
+
+
+def harmonize(result, target, bbox):
+    x1, y1, x2, y2 = bbox
+    roi = result[y1:y2, x1:x2]
+    ref = target[y1:y2, x1:x2]
+    if roi.size == 0:
+        return result
+
+    matched = lab_match(roi, ref)
+
+    mask = np.zeros((roi.shape[0], roi.shape[1]), np.float32)
+    cv2.ellipse(
+        mask,
+        (roi.shape[1] // 2, roi.shape[0] // 2),
+        (int(roi.shape[1] * 0.42), int(roi.shape[0] * 0.48)),
+        0, 0, 360, 1, -1
+    )
+    mask = cv2.GaussianBlur(mask, (0, 0), roi.shape[1] * 0.04)
+    mask = np.dstack([mask] * 3)
+
+    blended = (matched * mask + roi * (1 - mask)).astype(np.uint8)
+
+    out = result.copy()
+    out[y1:y2, x1:x2] = blended
+    return out
+
+
+# ---------- SHARPEN ----------
+
+def sharpen(img, bbox):
+    x1, y1, x2, y2 = bbox
     roi = img[y1:y2, x1:x2]
     if roi.size == 0:
         return img
 
-    sharp = unsharp_mask(roi, amount=amount, radius=radius, threshold=3)
-
-    mask = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.float32)
-    center = (roi.shape[1] // 2, roi.shape[0] // 2)
-    axes = (int(roi.shape[1] * 0.42), int(roi.shape[0] * 0.48))
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=roi.shape[1] * 0.03)
-
-    mask3 = np.dstack([mask, mask, mask])
-    blended = (sharp.astype(np.float32) * mask3 + roi.astype(np.float32) * (1 - mask3)).astype(np.uint8)
+    blur = cv2.GaussianBlur(roi, (0, 0), 1.2)
+    sharp = cv2.addWeighted(roi, 1.35, blur, -0.35, 0)
 
     out = img.copy()
-    out[y1:y2, x1:x2] = blended
+    out[y1:y2, x1:x2] = sharp
     return out
 
-# ---------------------------
-# Routes
-# ---------------------------
-@app.get("/")
-def root():
-    return {"status": "ok", "engine": "inswapper_128", "cpu": True}
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+# =========================
+# ROUTE
+# =========================
 
 @app.post("/swap/single")
 async def swap_single(
-    request: Request,
     source: UploadFile = File(...),
     target: UploadFile = File(...),
+
+    # ✅ exposed controls
+    restore_sharp_thresh: float = Query(85.0, ge=10.0, le=500.0),
+    restore_min_face_side: int = Query(120, ge=32, le=512),
+    restore_force: bool = Query(False),
+    restore_disable: bool = Query(False),
 ):
-    global SWAPPER
-    if SWAPPER is None:
-        raise HTTPException(status_code=500, detail="Swapper not initialized")
+    src = read_image(source)
+    tgt = read_image(target)
+    tgt_original = tgt.copy()
 
-    ip = request.client.host if request.client else "unknown"
-    if not check_rate(ip):
-        raise HTTPException(status_code=429, detail="Too many requests. Please wait a bit.")
+    src_faces = face_app.get(src)
+    tgt_faces = face_app.get(tgt)
 
-    src_img = await read_image(source)
-    tgt_img = await read_image(target)
-
-    # Downscale for speed / safety (CPU-friendly)
-    src_img = downscale_max(src_img, MAX_SIDE_SOURCE)
-    tgt_img = downscale_max(tgt_img, MAX_SIDE_TARGET)
-
-    src_faces = face_app.get(src_img)
-    tgt_faces = face_app.get(tgt_img)
-
-    if not src_faces:
-        raise HTTPException(status_code=400, detail="No face found in source image")
-    if not tgt_faces:
-        raise HTTPException(status_code=400, detail="No face found in target image")
+    if not src_faces or not tgt_faces:
+        raise HTTPException(400, "Face not detected")
 
     src_face = src_faces[0]
-    result = tgt_img.copy()
+    result = tgt.copy()
 
-def face_area(f):
-    x1, y1, x2, y2 = [float(v) for v in f.bbox]
-    return max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+    for face in tgt_faces:
+        # 1 swap
+        result = SWAPPER.get(result, face, src_face, paste_back=True)
 
-    # ✅ pick largest face only (main subject)
-    tgt_face = max(tgt_faces, key=face_area)
+        # bbox safe
+        h, w = result.shape[:2]
+        bb = clamp_bbox(*[int(v) for v in face.bbox], w, h)
+        if not bb:
+            continue
 
-    result = SWAPPER.get(result, tgt_face, src_face, paste_back=True)
-    result = sharpen_face_roi(result, tgt_face.bbox, amount=0.35, radius=1.2)
+        # 2 harmonize color
+        result = harmonize(result, tgt_original, bb)
 
+        # 3 restore (auto-gated)
+        if GFPGAN and (not restore_disable):
+            x1, y1, x2, y2 = bb
+            roi = result[y1:y2, x1:x2]
+            if roi.size > 0:
+                face_w = x2 - x1
+                face_h = y2 - y1
+
+                do_restore = restore_force or should_restore_face(
+                    roi_bgr=roi,
+                    face_w=face_w,
+                    face_h=face_h,
+                    sharp_thresh=float(restore_sharp_thresh),
+                    min_face_side=int(restore_min_face_side),
+                )
+
+                if do_restore:
+                    try:
+                        _, _, rest = GFPGAN.enhance(
+                            roi,
+                            has_aligned=False,
+                            paste_back=True
+                        )
+                        if rest.shape == roi.shape:
+                            result[y1:y2, x1:x2] = rest
+                    except Exception as e:
+                        print("GFPGAN failed:", e)
+
+        # 4 sharpen
+        result = sharpen(result, bb)
 
     ok, buf = cv2.imencode(".png", result)
     if not ok:
-        raise HTTPException(status_code=500, detail="Failed to encode image")
+        raise HTTPException(500, "Encode failed")
 
-    return Response(content=buf.tobytes(), media_type="image/png")
+    return Response(buf.tobytes(), media_type="image/png")

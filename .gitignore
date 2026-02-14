@@ -1,8 +1,15 @@
-__pycache__/
-*.pyc
+# venv
 .venv/
 venv/
-.env
-.env.*
-inswapper_128.onnx
+
+# models / weights
+models/
 *.onnx
+*.pth
+
+# python junk
+__pycache__/
+*.pyc
+
+# env
+.env
