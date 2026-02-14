@@ -30,8 +30,27 @@ def ensure_torchvision_functional_tensor():
 # CONFIG
 # =========================
 
-MODEL_PATH = "models/inswapper_128.onnx"
-GFPGAN_PATH = "models/GFPGANv1.4.pth"
+import os, pathlib, urllib.request
+
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_PATH = str(MODELS_DIR / "inswapper_128.onnx")
+MODEL_URL  = os.getenv("INSWAPPER_URL", "")  # set on Railway
+
+GFPGAN_PATH = str(MODELS_DIR / "GFPGANv1.4.pth")
+GFPGAN_URL  = os.getenv("GFPGAN_URL", "")    # optional
+
+def ensure_file(path: str, url: str, label: str):
+    if os.path.exists(path):
+        return
+    if not url:
+        raise RuntimeError(f"Missing {label}: {path}. Set {label}_URL env var.")
+    print(f"Downloading {label} -> {path}")
+    urllib.request.urlretrieve(url, path)
+    print(f"{label} downloaded.")
+
 
 providers = (
     ["CUDAExecutionProvider", "CPUExecutionProvider"]
