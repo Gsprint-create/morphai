@@ -195,14 +195,14 @@ def face_area(f):
     x1, y1, x2, y2 = [float(v) for v in f.bbox]
     return max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
 
-# pick the largest target face only
-tgt_face = max(tgt_faces, key=face_area)
+ # pick the largest target face only
+ tgt_face = max(tgt_faces, key=face_area)
 
-result = SWAPPER.get(result, tgt_face, src_face, paste_back=True)
-result = sharpen_face_roi(result, tgt_face.bbox, amount=0.35, radius=1.2)
+ result = SWAPPER.get(result, tgt_face, src_face, paste_back=True)
+ result = sharpen_face_roi(result, tgt_face.bbox, amount=0.35, radius=1.2)
 
 
-   ok, buf = cv2.imencode(".png", result)
+    ok, buf = cv2.imencode(".png", result)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode image")
 
