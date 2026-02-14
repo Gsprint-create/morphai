@@ -191,7 +191,7 @@ async def swap_single(
     src_face = src_faces[0]
     result = tgt_img.copy()
 
-    def face_area(f):
+def face_area(f):
     x1, y1, x2, y2 = [float(v) for v in f.bbox]
     return max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
 
