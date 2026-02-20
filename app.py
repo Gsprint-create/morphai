@@ -68,7 +68,7 @@ RL_WINDOW_SEC = int(os.environ.get("RL_WINDOW_SEC", "60"))          # time windo
 RL_MAX_REQ = int(os.environ.get("RL_MAX_REQ", "8"))                 # max swaps per window per IP
 
 # Optional: enable/disable NSFW gate via env (default enabled)
-NSFW_ENABLED = os.environ.get("NSFW_ENABLED", "1").strip() not in ("0", "false", "False", "")
+NSFW_ENABLED = os.environ.get("NSFW_ENABLED", "0").strip() not in ("0", "false", "False", "")
 
 # -------------------------
 # FastAPI + CORS
