@@ -3,25 +3,30 @@ from __future__ import annotations
 import os
 import time
 import urllib.request
-from typing import Optional, Tuple, List
+import tempfile
+from typing import Optional, Tuple, List, Dict, Deque
+from collections import defaultdict, deque
 
 import cv2
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
 
+
 # =========================================================
 # MorphAI ULTRA (FaceSwap + Color Harmonize + Auto Restore + Sharpen)
 #
-# Goals:
-# - Runs on CPU (Railway) or GPU (local/RunPod) automatically.
-# - Does NOT crash if GFPGAN deps are missing: restoration becomes optional.
-# - Works when model files are NOT committed: can download via env URLs.
+# Added Safety Controls (IMPORTANT):
+# - NSFW / Nudity gate (blocks explicit images)
+# - Consent required (user confirms permission/rights)
+# - Rate limiting (basic abuse prevention)
+# - File type + size checks
 # =========================================================
 
 # -------------------------
@@ -32,10 +37,10 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 INSWAPPER_PATH = os.environ.get("INSWAPPER_PATH", os.path.join(MODELS_DIR, "inswapper_128.onnx"))
-INSWAPPER_URL  = os.environ.get("INSWAPPER_URL", "").strip()  # must be a direct download link
+INSWAPPER_URL = os.environ.get("INSWAPPER_URL", "").strip()  # direct download link
 
 GFPGAN_PATH = os.environ.get("GFPGAN_PATH", os.path.join(MODELS_DIR, "GFPGANv1.4.pth"))
-GFPGAN_URL  = os.environ.get("GFPGAN_URL", "").strip()  # must be a direct download link
+GFPGAN_URL = os.environ.get("GFPGAN_URL", "").strip()  # direct download link
 
 # -------------------------
 # Providers (GPU if available)
@@ -45,6 +50,25 @@ PROVIDERS = (["CUDAExecutionProvider", "CPUExecutionProvider"]
              if "CUDAExecutionProvider" in AVAILABLE_PROVIDERS
              else ["CPUExecutionProvider"])
 USING_GPU = PROVIDERS[0] == "CUDAExecutionProvider"
+
+# -------------------------
+# Safety Settings
+# -------------------------
+# Allowed content-types for uploads
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+# Max upload size (bytes) - adjust as needed
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # default 8MB
+
+# NSFW threshold: higher = stricter (0.70 is a good start)
+NSFW_THRESHOLD = float(os.environ.get("NSFW_THRESHOLD", "0.70"))
+
+# Rate limiting
+RL_WINDOW_SEC = int(os.environ.get("RL_WINDOW_SEC", "60"))          # time window
+RL_MAX_REQ = int(os.environ.get("RL_MAX_REQ", "8"))                 # max swaps per window per IP
+
+# Optional: enable/disable NSFW gate via env (default enabled)
+NSFW_ENABLED = os.environ.get("NSFW_ENABLED", "1").strip() not in ("0", "false", "False", "")
 
 # -------------------------
 # FastAPI + CORS
@@ -78,11 +102,17 @@ GFPGAN = None
 GFPGAN_ENABLED = False
 GFPGAN_IMPORT_ERROR: Optional[str] = None
 
+# NSFW classifier (lazy)
+_NSFW_CLASSIFIER = None
+_NSFW_IMPORT_ERROR: Optional[str] = None
+
+# Rate limit store (in-memory; for beta)
+_hits: Dict[str, Deque[float]] = defaultdict(deque)
+
 
 # =========================================================
 # Model utilities
 # =========================================================
-
 def _download(url: str, out_path: str, timeout: int = 60) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     tmp = out_path + ".tmp"
@@ -142,9 +172,61 @@ def try_load_gfpgan(model_path: str):
 
 
 # =========================================================
+# NSFW / Nudity Safety
+# =========================================================
+def _get_nsfw_classifier():
+    """
+    Uses NudeNet (CPU-friendly) as a gate for explicit imagery.
+    Install: pip install nudenet pillow
+    """
+    global _NSFW_CLASSIFIER, _NSFW_IMPORT_ERROR
+    if _NSFW_CLASSIFIER is not None or _NSFW_IMPORT_ERROR is not None:
+        return _NSFW_CLASSIFIER
+
+    try:
+        from nudenet import NudeClassifier  # type: ignore
+        _NSFW_CLASSIFIER = NudeClassifier()  # downloads weights on first run
+        _NSFW_IMPORT_ERROR = None
+        print("[MorphAI] NSFW classifier loaded (NudeNet).")
+    except Exception as e:
+        _NSFW_CLASSIFIER = None
+        _NSFW_IMPORT_ERROR = repr(e)
+        print("[MorphAI] NSFW classifier import failed:", _NSFW_IMPORT_ERROR)
+
+    return _NSFW_CLASSIFIER
+
+def is_explicit_bytes(data: bytes, threshold: float) -> bool:
+    """
+    Returns True if image is classified as unsafe above threshold.
+    NudeNet expects a file path, so we write a temp file.
+    """
+    clf = _get_nsfw_classifier()
+    if clf is None:
+        # If NSFW enabled but classifier missing, we fail closed (safer).
+        raise HTTPException(
+            status_code=503,
+            detail="Safety model unavailable. Install 'nudenet' (and pillow) or set NSFW_ENABLED=0 for dev only."
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        res = clf.classify(tmp_path)  # {path: {"safe": p, "unsafe": p}}
+        scores = res.get(tmp_path, {}) or {}
+        unsafe = float(scores.get("unsafe", 0.0))
+        return unsafe >= float(threshold)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+# =========================================================
 # Startup
 # =========================================================
-
 @app.on_event("startup")
 def startup():
     global face_app, SWAPPER
@@ -168,19 +250,31 @@ def startup():
 
     try_load_gfpgan(GFPGAN_PATH)
 
+    # Preload NSFW model (optional; still lazy-safe)
+    if NSFW_ENABLED:
+        _get_nsfw_classifier()
+
 
 # =========================================================
 # Helpers
 # =========================================================
-
-async def read_image(upload: UploadFile) -> np.ndarray:
+async def read_image(upload: UploadFile) -> Tuple[np.ndarray, bytes]:
     data = await upload.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty upload")
+
+    # Content-type guard
+    if upload.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPG/PNG/WEBP images are allowed")
+
+    # Size guard
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"Image too large (max {MAX_UPLOAD_BYTES // (1024*1024)}MB)")
+
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image file")
-    return img
+    return img, data
 
 def clamp_bbox(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
     x1 = max(0, x1); y1 = max(0, y1)
@@ -286,9 +380,37 @@ def sharpen_face_roi(bgr: np.ndarray, bbox: Tuple[int, int, int, int], amount: f
 
 
 # =========================================================
+# Rate limiting middleware
+# =========================================================
+def _client_ip(request: Request) -> str:
+    # If behind proxy/CDN, you may have: X-Forwarded-For or CF-Connecting-IP
+    xf = request.headers.get("x-forwarded-for")
+    if xf:
+        return xf.split(",")[0].strip()
+    cf = request.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    return request.client.host if request.client else "unknown"
+
+@app.middleware("http")
+async def rate_limit_mw(request: Request, call_next):
+    # Limit only swap endpoints
+    if request.url.path.startswith("/swap/"):
+        ip = _client_ip(request)
+        now = time.time()
+        q = _hits[ip]
+        while q and q[0] < now - RL_WINDOW_SEC:
+            q.popleft()
+        if len(q) >= RL_MAX_REQ:
+            return JSONResponse({"detail": "Too many requests. Please try again later."}, status_code=429)
+        q.append(now)
+
+    return await call_next(request)
+
+
+# =========================================================
 # Routes
 # =========================================================
-
 @app.get("/")
 def root():
     return {
@@ -299,6 +421,13 @@ def root():
         "gpu": USING_GPU,
         "gfpgan": bool(GFPGAN_ENABLED),
         "gfpgan_import_error": GFPGAN_IMPORT_ERROR,
+        "nsfw_enabled": bool(NSFW_ENABLED),
+        "nsfw_threshold": NSFW_THRESHOLD,
+        "nsfw_import_error": _NSFW_IMPORT_ERROR,
+        "limits": {
+            "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+            "rate_limit": {"window_sec": RL_WINDOW_SEC, "max_req": RL_MAX_REQ},
+        },
     }
 
 @app.get("/health")
@@ -311,12 +440,18 @@ def health():
         "inswapper_exists": os.path.exists(INSWAPPER_PATH),
         "gfpgan_exists": os.path.exists(GFPGAN_PATH),
         "gfpgan_enabled": bool(GFPGAN_ENABLED),
+        "nsfw_enabled": bool(NSFW_ENABLED),
+        "nsfw_ready": (not NSFW_ENABLED) or (_get_nsfw_classifier() is not None),
     }
 
 @app.post("/swap/single")
 async def swap_single(
+    # Images
     source: UploadFile = File(...),
     target: UploadFile = File(...),
+
+    # SAFETY: consent required (frontend must send this field)
+    consent: bool = Form(..., description="User confirms they have permission/rights to use both images."),
 
     # Selection
     swap_all: bool = Query(True, description="Swap all detected faces in target; if false, only the largest face."),
@@ -340,9 +475,20 @@ async def swap_single(
     if SWAPPER is None or face_app is None:
         raise HTTPException(status_code=500, detail="Models not initialized")
 
-    src_img = await read_image(source)
-    tgt_img = await read_image(target)
+    # Consent gate
+    if not consent:
+        raise HTTPException(status_code=400, detail="Consent required to use this tool.")
 
+    # Read images (returns bgr + raw bytes)
+    src_img, src_bytes = await read_image(source)
+    tgt_img, tgt_bytes = await read_image(target)
+
+    # NSFW gate (blocks nude/explicit uploads – this is the big protection)
+    if NSFW_ENABLED:
+        if is_explicit_bytes(src_bytes, threshold=NSFW_THRESHOLD) or is_explicit_bytes(tgt_bytes, threshold=NSFW_THRESHOLD):
+            raise HTTPException(status_code=400, detail="Blocked: explicit/adult images are not allowed.")
+
+    # Face detection
     src_faces = face_app.get(src_img)
     tgt_faces = face_app.get(tgt_img)
 
@@ -370,7 +516,7 @@ async def swap_single(
         if not bb:
             continue
 
-        # 1) color harmonize (helps with SD-like lighting consistency)
+        # 1) color harmonize (helps with lighting consistency)
         if harmonize_enable:
             result = harmonize(result, tgt_original, bb)
 
@@ -398,7 +544,7 @@ async def swap_single(
                         # never crash the request due to restoration
                         print("[MorphAI] GFPGAN enhance failed:", repr(e))
 
-        # 3) sharpen (recovers edge crispness after swap/restore)
+        # 3) sharpen (recovers edge crispness)
         result = sharpen_face_roi(result, bb, amount=float(sharpen_amount), radius=float(sharpen_radius))
 
     dt_ms = int((time.time() - t0) * 1000)
@@ -410,6 +556,8 @@ async def swap_single(
             "gpu": USING_GPU,
             "using": PROVIDERS,
             "ms": dt_ms,
+            "nsfw_enabled": bool(NSFW_ENABLED),
+            "nsfw_threshold": NSFW_THRESHOLD,
         })
 
     ok, buf = cv2.imencode(".png", result)
@@ -422,5 +570,7 @@ async def swap_single(
         "X-Swapped-Faces": str(swapped_count),
         "X-Restored-Faces": str(restored_count),
         "X-Time-MS": str(dt_ms),
+        "X-NSFW-Enabled": "1" if NSFW_ENABLED else "0",
+        "X-NSFW-Threshold": str(NSFW_THRESHOLD),
     }
     return Response(content=buf.tobytes(), media_type="image/png", headers=headers)
