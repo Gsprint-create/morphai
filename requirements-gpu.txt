@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 python-multipart
+nudenet
+pillow
 
 # --- hard pins to avoid ABI breakages ---
 numpy==1.26.4

@@ -570,7 +570,7 @@ async def swap_single(
         "X-Swapped-Faces": str(swapped_count),
         "X-Restored-Faces": str(restored_count),
         "X-Time-MS": str(dt_ms),
-        "X-NSFW-Enabled": "1" if NSFW_ENABLED else "0",
+        "X-NSFW-Enabled": "0" if NSFW_ENABLED else "0",
         "X-NSFW-Threshold": str(NSFW_THRESHOLD),
     }
     return Response(content=buf.tobytes(), media_type="image/png", headers=headers)
