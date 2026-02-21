@@ -3,6 +3,7 @@ uvicorn[standard]
 python-multipart
 nudenet
 pillow
+openai>=1.0.0
 
 # --- hard pins to avoid ABI breakages ---
 numpy==1.26.4

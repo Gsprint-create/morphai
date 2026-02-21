@@ -11,6 +11,10 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+import base64
+from pydantic import BaseModel, Field
+from openai import OpenAI
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
@@ -109,6 +113,27 @@ _NSFW_IMPORT_ERROR: Optional[str] = None
 # Rate limit store (in-memory; for beta)
 _hits: Dict[str, Deque[float]] = defaultdict(deque)
 
+# =========================================================
+# Genix (OpenAI Image Generation)
+# =========================================================
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1").strip()
+
+_openai_client: Optional[OpenAI] = None
+
+def _get_openai() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("Missing OPENAI_API_KEY env var")
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
+class GenixRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, max_length=2000)
+    size: str = Field("1024x1024")  # "1024x1024" | "1024x1536" | "1536x1024"
+
+GENIX_VALID_SIZES = {"1024x1024", "1024x1536", "1536x1024"}
 
 # =========================================================
 # Model utilities
@@ -444,6 +469,50 @@ def health():
         "nsfw_ready": (not NSFW_ENABLED) or (_get_nsfw_classifier() is not None),
     }
 
+@app.post("/genix/generate")
+def genix_generate(req: GenixRequest):
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+    if req.size not in GENIX_VALID_SIZES:
+        raise HTTPException(status_code=400, detail=f"Invalid size. Use one of: {sorted(GENIX_VALID_SIZES)}")
+
+    # 1) Moderation (recommended)
+    try:
+        client = _get_openai()
+        mod = client.moderations.create(input=prompt)
+        flagged = bool(mod.results[0].flagged) if mod and mod.results else False
+        if flagged:
+            raise HTTPException(status_code=400, detail="Prompt blocked by safety system.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # If moderation is temporarily unavailable, you can choose fail-open or fail-closed.
+        # For production safety, fail-closed is better:
+        # raise HTTPException(status_code=503, detail="Safety system unavailable. Please try again later.")
+        print("[Genix] moderation error:", repr(e))
+
+    # 2) Generate image -> return PNG bytes
+    try:
+        client = _get_openai()
+        img = client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size=req.size,
+            n=1,
+            output_format="png",
+        )
+        b64 = img.data[0].b64_json
+        if not b64:
+            raise RuntimeError("No b64_json returned from OpenAI image API")
+        png_bytes = base64.b64decode(b64)
+        return Response(content=png_bytes, media_type="image/png")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[Genix] generate error:", repr(e))
+        raise HTTPException(status_code=500, detail="Image generation failed.")
+        
 @app.post("/swap/single")
 async def swap_single(
     # Images
