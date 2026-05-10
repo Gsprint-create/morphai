@@ -209,8 +209,8 @@ def _get_nsfw_classifier():
         return _NSFW_CLASSIFIER
 
     try:
-        from nudenet import NudeClassifier  # type: ignore
-        _NSFW_CLASSIFIER = NudeClassifier()  # downloads weights on first run
+        from nudenet import NudeDetector  # type: ignore
+        __NSFW_CLASSIFIER = NudeDetector()  # downloads weights on first run
         _NSFW_IMPORT_ERROR = None
         print("[MorphAI] NSFW classifier loaded (NudeNet).")
     except Exception as e:
@@ -221,13 +221,8 @@ def _get_nsfw_classifier():
     return _NSFW_CLASSIFIER
 
 def is_explicit_bytes(data: bytes, threshold: float) -> bool:
-    """
-    Returns True if image is classified as unsafe above threshold.
-    NudeNet expects a file path, so we write a temp file.
-    """
     clf = _get_nsfw_classifier()
     if clf is None:
-        # If NSFW enabled but classifier missing, we fail closed (safer).
         raise HTTPException(
             status_code=503,
             detail="Safety model unavailable. Install 'nudenet' (and pillow) or set NSFW_ENABLED=0 for dev only."
@@ -238,10 +233,25 @@ def is_explicit_bytes(data: bytes, threshold: float) -> bool:
         tmp_path = tmp.name
 
     try:
-        res = clf.classify(tmp_path)  # {path: {"safe": p, "unsafe": p}}
-        scores = res.get(tmp_path, {}) or {}
-        unsafe = float(scores.get("unsafe", 0.0))
-        return unsafe >= float(threshold)
+        detections = clf.detect(tmp_path)
+
+        unsafe_labels = {
+            "FEMALE_BREAST_EXPOSED",
+            "FEMALE_GENITALIA_EXPOSED",
+            "MALE_GENITALIA_EXPOSED",
+            "ANUS_EXPOSED",
+            "BUTTOCKS_EXPOSED",
+        }
+
+        for item in detections:
+            label = item.get("class")
+            score = float(item.get("score", 0.0))
+
+            if label in unsafe_labels and score >= threshold:
+                return True
+
+        return False
+
     finally:
         try:
             os.remove(tmp_path)
