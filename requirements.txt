@@ -11,3 +11,4 @@ basicsr==1.4.2
 nudenet
 pillow
 openai>=1.0.0
+tensorflow
