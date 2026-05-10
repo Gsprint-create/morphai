@@ -200,25 +200,23 @@ def try_load_gfpgan(model_path: str):
 # NSFW / Nudity Safety
 # =========================================================
 def _get_nsfw_classifier():
-    """
-    Uses NudeNet (CPU-friendly) as a gate for explicit imagery.
-    Install: pip install nudenet pillow
-    """
     global _NSFW_CLASSIFIER, _NSFW_IMPORT_ERROR
-    if _NSFW_CLASSIFIER is not None or _NSFW_IMPORT_ERROR is not None:
+
+    if _NSFW_CLASSIFIER is not None:
         return _NSFW_CLASSIFIER
 
     try:
-        from nudenet import NudeDetector  # type: ignore
-        __NSFW_CLASSIFIER = NudeDetector()  # downloads weights on first run
+        from nudenet import NudeDetector
+        _NSFW_CLASSIFIER = NudeDetector()
         _NSFW_IMPORT_ERROR = None
-        print("[MorphAI] NSFW classifier loaded (NudeNet).")
+        print("[MorphAI] NSFW detector loaded (NudeDetector).")
+        return _NSFW_CLASSIFIER
+
     except Exception as e:
         _NSFW_CLASSIFIER = None
         _NSFW_IMPORT_ERROR = repr(e)
-        print("[MorphAI] NSFW classifier import failed:", _NSFW_IMPORT_ERROR)
-
-    return _NSFW_CLASSIFIER
+        print("[MorphAI] NSFW detector failed:", _NSFW_IMPORT_ERROR)
+        return None
 
 def is_explicit_bytes(data: bytes, threshold: float) -> bool:
     clf = _get_nsfw_classifier()
