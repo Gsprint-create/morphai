@@ -616,8 +616,9 @@ def generate_video(req: VideoRequest):
         }
 
     except Exception as e:
-        print("[Runway] create error:", repr(e))
-        raise HTTPException(status_code=500, detail="Video generation failed to start.")
+        err = repr(e)
+        print("[Runway] create error:", err)
+        raise HTTPException(status_code=500, detail=f"Runway start failed: {err}")
 
 
 @app.get("/jobs/{job_id}")
