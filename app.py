@@ -595,7 +595,7 @@ def generate_video(req: VideoRequest):
             prompt_image=req.image_url,
             prompt_text=req.prompt,
             duration=req.seconds,
-            ratio="16:9",
+            ratio="1280:720",
         )
 
         job_id = str(task.id)
