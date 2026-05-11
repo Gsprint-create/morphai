@@ -4,6 +4,7 @@ import os
 import time
 import urllib.request
 import tempfile
+from uuid import uuid4
 from typing import Optional, Tuple, List, Dict, Deque
 from collections import defaultdict, deque
 
@@ -256,6 +257,34 @@ def is_explicit_bytes(data: bytes, threshold: float) -> bool:
         except Exception:
             pass
 
+# =========================================================
+# Runway Video Generation
+# =========================================================
+try:
+    from runwayml import RunwayML
+except Exception:
+    RunwayML = None
+
+RUNWAY_API_KEY = os.environ.get("RUNWAY_API_KEY", "").strip()
+RUNWAY_MODEL = os.environ.get("RUNWAY_MODEL", "gen4.5").strip()
+
+VIDEO_JOBS = {}
+
+
+class VideoRequest(BaseModel):
+    image_url: str = Field(..., min_length=8)
+    prompt: str = Field(..., min_length=3, max_length=1000)
+    negative_prompt: str = ""
+    seconds: int = 5
+    fps: int = 24
+
+
+def get_runway_client():
+    if RunwayML is None:
+        raise HTTPException(status_code=500, detail="Runway SDK not installed.")
+    if not RUNWAY_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing RUNWAY_API_KEY.")
+    return RunwayML(api_key=RUNWAY_API_KEY)
 
 # =========================================================
 # Startup
@@ -520,6 +549,87 @@ def genix_generate(req: GenixRequest):
     except Exception as e:
         print("[Genix] generate error:", repr(e))
         raise HTTPException(status_code=500, detail="Image generation failed.")
+        
+@app.post("/generate-video")
+def generate_video(req: VideoRequest):
+    if req.seconds not in (5, 10):
+        raise HTTPException(status_code=400, detail="Runway supports 5 or 10 seconds.")
+
+    client = get_runway_client()
+
+    try:
+        task = client.image_to_video.create(
+            model=RUNWAY_MODEL,
+            prompt_image=req.image_url,
+            prompt_text=req.prompt,
+            duration=req.seconds,
+            ratio="16:9",
+        )
+
+        job_id = str(task.id)
+
+        VIDEO_JOBS[job_id] = {
+            "provider": "runway",
+            "provider_task_id": str(task.id),
+            "status": "running",
+            "progress": 5,
+            "output_url": "",
+            "created_at": time.time(),
+        }
+
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "progress": 5,
+        }
+
+    except Exception as e:
+        print("[Runway] create error:", repr(e))
+        raise HTTPException(status_code=500, detail="Video generation failed to start.")
+
+
+@app.get("/jobs/{job_id}")
+def get_video_job(job_id: str):
+    job = VIDEO_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    client = get_runway_client()
+
+    try:
+        task = client.tasks.retrieve(job["provider_task_id"])
+        status = getattr(task, "status", "")
+
+        output_url = ""
+        output = getattr(task, "output", None)
+
+        if isinstance(output, list) and output:
+            output_url = output[0]
+        elif isinstance(output, str):
+            output_url = output
+
+        if status in ("SUCCEEDED", "succeeded", "completed"):
+            job["status"] = "done"
+            job["progress"] = 100
+            job["output_url"] = output_url
+        elif status in ("FAILED", "failed"):
+            job["status"] = "failed"
+            job["progress"] = 0
+        else:
+            job["status"] = "running"
+            job["progress"] = min(95, job.get("progress", 5) + 5)
+
+        return {
+            "job_id": job_id,
+            "status": job["status"],
+            "progress": job["progress"],
+            "output_url": job.get("output_url", ""),
+            "output_key": "",
+        }
+
+    except Exception as e:
+        print("[Runway] poll error:", repr(e))
+        raise HTTPException(status_code=500, detail="Could not check video job.") 
         
 @app.post("/swap/single")
 async def swap_single(
