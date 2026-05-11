@@ -7,10 +7,12 @@ import tempfile
 from uuid import uuid4
 from typing import Optional, Tuple, List, Dict, Deque
 from collections import defaultdict, deque
+from fastapi.staticfiles import StaticFiles
 
 import cv2
 import numpy as np
 import onnxruntime as ort
+
 
 import base64
 from pydantic import BaseModel, Field
@@ -79,6 +81,10 @@ NSFW_ENABLED = os.environ.get("NSFW_ENABLED", "1").strip() not in ("0", "false",
 # FastAPI + CORS
 # -------------------------
 app = FastAPI(title="MorphAI ULTRA FaceSwap", version="1.0")
+
+UPLOADS_DIR = os.path.join(BASE_DIR, "public_uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,
@@ -549,6 +555,32 @@ def genix_generate(req: GenixRequest):
     except Exception as e:
         print("[Genix] generate error:", repr(e))
         raise HTTPException(status_code=500, detail="Image generation failed.")
+
+@app.post("/upload-image")
+async def upload_image(file: UploadFile = File(...)):
+    img, data = await read_image(file)
+
+    if NSFW_ENABLED and is_explicit_bytes(data, threshold=NSFW_THRESHOLD):
+        raise HTTPException(status_code=400, detail="Blocked: explicit/adult images are not allowed.")
+
+    import uuid
+
+    upload_dir = os.path.join(BASE_DIR, "public_uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+
+    filename = f"{uuid.uuid4().hex}{ext}"
+    out_path = os.path.join(upload_dir, filename)
+
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    public_url = f"{os.environ.get('PUBLIC_BACKEND_URL', '').rstrip()}/uploads/{filename}"
+
+    return {"url": public_url}       
         
 @app.post("/generate-video")
 def generate_video(req: VideoRequest):
