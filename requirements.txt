@@ -12,3 +12,4 @@ nudenet
 pillow
 openai>=1.0.0
 tensorflow
+runwayml
