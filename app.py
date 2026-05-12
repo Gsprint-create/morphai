@@ -4,6 +4,7 @@ import os
 import time
 import urllib.request
 import tempfile
+import asyncio
 from uuid import uuid4
 from typing import Optional, Tuple, List, Dict, Deque
 from collections import defaultdict, deque
@@ -48,6 +49,9 @@ INSWAPPER_URL = os.environ.get("INSWAPPER_URL", "").strip()  # direct download l
 
 GFPGAN_PATH = os.environ.get("GFPGAN_PATH", os.path.join(MODELS_DIR, "GFPGANv1.4.pth"))
 GFPGAN_URL = os.environ.get("GFPGAN_URL", "").strip()  # direct download link
+
+FACE_SWAP_CONCURRENCY = int(os.environ.get("FACE_SWAP_CONCURRENCY", "1"))
+FACE_SWAP_QUEUE_TIMEOUT_SEC = int(os.environ.get("FACE_SWAP_QUEUE_TIMEOUT_SEC", "180"))
 
 # -------------------------
 # Providers (GPU if available)
@@ -119,6 +123,7 @@ _NSFW_IMPORT_ERROR: Optional[str] = None
 
 # Rate limit store (in-memory; for beta)
 _hits: Dict[str, Deque[float]] = defaultdict(deque)
+_face_swap_semaphore = asyncio.Semaphore(FACE_SWAP_CONCURRENCY)
 
 # =========================================================
 # Genix (OpenAI Image Generation)
@@ -461,17 +466,43 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 @app.middleware("http")
-async def rate_limit_mw(request: Request, call_next):
-    # Limit only swap endpoints
+async def rate_limit_and_queue_mw(request: Request, call_next):
     if request.url.path.startswith("/swap/"):
         ip = _client_ip(request)
         now = time.time()
+
+        # Rate limit
         q = _hits[ip]
         while q and q[0] < now - RL_WINDOW_SEC:
             q.popleft()
+
         if len(q) >= RL_MAX_REQ:
-            return JSONResponse({"detail": "Too many requests. Please try again later."}, status_code=429)
+            return JSONResponse(
+                {"detail": "Too many requests. Please try again later."},
+                status_code=429,
+            )
+
         q.append(now)
+
+        # FaceSwap queue / concurrency guard
+        try:
+            await asyncio.wait_for(
+                _face_swap_semaphore.acquire(),
+                timeout=FACE_SWAP_QUEUE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"detail": "FaceSwap is busy. Please try again in a moment."},
+                status_code=429,
+            )
+
+        try:
+            response = await call_next(request)
+            response.headers["X-FaceSwap-Queue"] = "enabled"
+            response.headers["X-FaceSwap-Concurrency"] = str(FACE_SWAP_CONCURRENCY)
+            return response
+        finally:
+            _face_swap_semaphore.release()
 
     return await call_next(request)
 
