@@ -561,6 +561,9 @@ def genix_generate(req: GenixRequest):
     except HTTPException:
         raise
     except Exception as e:
+        err = repr(e)
+        print("[Genix] generate error:", err)
+        raise HTTPException(status_code=500, detail=f"Genix failed: {err}")
         # If moderation is temporarily unavailable, you can choose fail-open or fail-closed.
         # For production safety, fail-closed is better:
         # raise HTTPException(status_code=503, detail="Safety system unavailable. Please try again later.")
