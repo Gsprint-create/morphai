@@ -650,10 +650,10 @@ def generate_video(req: VideoRequest):
         }
 
     except Exception as e:
-    # Full provider error stays in server logs only
-    print("[VidX] video generation create error:", repr(e))
+        # Full provider error stays in server logs only
+        print("[VidX] video generation create error:", repr(e))
 
-    err_text = str(e).lower()
+        err_text = str(e).lower()
 
     if "not enough credits" in err_text:
         raise HTTPException(
