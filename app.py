@@ -563,7 +563,7 @@ def genix_generate(req: GenixRequest):
     except Exception as e:
         err = repr(e)
         print("[Genix] generate error:", err)
-        raise HTTPException(status_code=500, detail=f"Genix failed: {err}")
+        raise HTTPException(status_code=500, detail="GeniX safety check is temporarily unavailable. Please try again later.")
         # If moderation is temporarily unavailable, you can choose fail-open or fail-closed.
         # For production safety, fail-closed is better:
         # raise HTTPException(status_code=503, detail="Safety system unavailable. Please try again later.")
@@ -619,7 +619,7 @@ async def upload_image(file: UploadFile = File(...)):
 @app.post("/generate-video")
 def generate_video(req: VideoRequest):
     if req.seconds not in (5, 10):
-        raise HTTPException(status_code=400, detail="Runway supports 5 or 10 seconds.")
+        raise HTTPException(status_code=400, detail="VidX currently supports 5 or 10 second videos.")
 
     client = get_runway_client()
 
@@ -650,9 +650,27 @@ def generate_video(req: VideoRequest):
         }
 
     except Exception as e:
-        err = repr(e)
-        print("[Runway] create error:", err)
-        raise HTTPException(status_code=500, detail=f"Runway start failed: {err}")
+    # Full provider error stays in server logs only
+    print("[VidX] video generation create error:", repr(e))
+
+    err_text = str(e).lower()
+
+    if "not enough credits" in err_text:
+        raise HTTPException(
+            status_code=503,
+            detail="VidX video generation is temporarily unavailable. Please try again later."
+        )
+
+    if "rate limit" in err_text or "too many requests" in err_text:
+        raise HTTPException(
+            status_code=429,
+            detail="VidX is currently busy. Please try again shortly."
+        )
+
+    raise HTTPException(
+        status_code=500,
+        detail="VidX could not start the video generation. Please try again later."
+    )
 
 
 @app.get("/jobs/{job_id}")
